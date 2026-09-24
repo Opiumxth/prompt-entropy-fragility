@@ -1,9 +1,8 @@
 """
 model_runner.py
 
-Handles loading open-source LLMs (Llama-3-8B, Gemma-2) via Hugging Face
-Transformers and extracting raw output logits for the first k generated
-tokens.
+Handles loading Gemma-2 9B via Hugging Face Transformers
+and extracting raw output logits for the first k generated tokens.
 """
 
 import torch
@@ -15,44 +14,78 @@ def load_model(model_name: str, device: str = None):
     Loads a causal LLM and its tokenizer.
 
     Args:
-        model_name: Hugging Face model identifier
-            (e.g. "meta-llama/Meta-Llama-3-8B", "google/gemma-2-9b").
-        device: Target device ("cuda" or "cpu"). Auto-detected if None.
+        model_name: Hugging Face model identifier.
+        device: Target device ("cuda" or "cpu").
+                  Auto-detected if None.
 
     Returns:
         (model, tokenizer) tuple.
     """
+
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device)
+
     model.eval()
+
     return model, tokenizer
 
 
-def extract_logits(model, tokenizer, prompt: str, k: int = 5, device: str = "cpu"):
+def extract_logits(
+    model,
+    tokenizer,
+    prompt: str,
+    k: int = 5,
+    device: str = None
+):
     """
-    Runs inference on the given prompt and extracts the raw logits
-    for the first k generated tokens.
+    Generates up to k tokens and extracts the raw logits
+    for each generated token.
 
     Args:
-        model: Loaded Hugging Face causal LM.
+        model: Loaded causal language model.
         tokenizer: Corresponding tokenizer.
-        prompt: Input prompt string.
-        k: Number of initial tokens to extract logits for.
-        device: Device the model is on.
+        prompt: Input prompt.
+        k: Number of generated tokens to analyze.
+        device: Device where the model is located.
 
     Returns:
-        List of numpy arrays, one per generated token, each containing
-        the raw logit vector over the vocabulary.
-
-    Implementation note: use model.generate(..., output_scores=True,
-    return_dict_in_generate=True) to capture per-step logits before
-    sampling/argmax selection.
+        List of numpy arrays containing the logits for each
+        generation step.
     """
-    # TODO: implement generation loop with output_scores=True
-    raise NotImplementedError
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    # Tokenize prompt
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt"
+    ).to(device)
+
+    # Generate k tokens and keep the scores
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=k,
+            do_sample=False,
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+
+    # outputs.scores contains one tensor per generated token.
+    # Each tensor has shape:
+    # [batch_size, vocabulary_size]
+    logits = [
+        score[0].detach().cpu().numpy()
+        for score in outputs.scores
+    ]
+
+    return logits
+
