@@ -1,8 +1,27 @@
 """
 model_runner.py
 
-Handles loading Gemma-2 9B via Hugging Face Transformers
-and extracting raw output logits for the first k generated tokens.
+Handles loading Gemma-2 via Hugging Face Transformers and extracting
+raw output logits for the first k generated tokens.
+
+Model note: Gemma-2 checkpoints (e.g. "google/gemma-2-2b",
+"google/gemma-2-9b") are gated on the Hugging Face Hub -- you still need
+a HF account, to accept Google's usage license on the model page, and
+to run `huggingface-cli login` (or set the HF_TOKEN env var) before
+`from_pretrained` will succeed. It avoids Meta's separate approval-review
+process for Llama-3, but it is not "ungated" in the sense of anonymous
+access.
+
+CPU note: this pipeline works on CPU, but two steps are the bottleneck
+for a model in the 2B-9B range:
+  1. `from_pretrained` in load_model() -- downloading + materializing
+     billions of float32 params into RAM (9B params * 4 bytes ~= 36GB).
+  2. `model.generate` in extract_logits() -- each forward pass is
+     dominated by CPU matmuls with no batching/kernel fusion benefits
+     from cuda, so k tokens can take from several seconds to minutes
+     per prompt depending on model size and CPU.
+For quick CPU-only smoke tests, prefer a small checkpoint such as
+"google/gemma-2-2b"; reserve "google/gemma-2-9b" for GPU runs.
 """
 
 import torch
@@ -27,9 +46,22 @@ def load_model(model_name: str, device: str = None):
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    # Some causal LM tokenizers (e.g. GPT-2 style) ship without a pad
+    # token, which makes generate() raise/warn. Gemma-2's tokenizer
+    # already defines one, but we fall back to eos_token defensively
+    # so this function stays generic across model families.
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # SLOW ON CPU: this line downloads (first run) and loads the full
+    # parameter set into memory. For gemma-2-9b in float32 that is
+    # ~36GB of RAM -- likely to be slow or to fail on a laptop.
+    # low_cpu_mem_usage streams weights in instead of doubling peak
+    # RAM usage during load.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        low_cpu_mem_usage=True,
     ).to(device)
 
     model.eval()
@@ -69,7 +101,14 @@ def extract_logits(
         return_tensors="pt"
     ).to(device)
 
-    # Generate k tokens and keep the scores
+    # SLOW ON CPU: each of the k forward passes below runs at CPU
+    # matmul speed (no tensor-core acceleration). Expect this to
+    # dominate wall-clock time for the whole pipeline on CPU-only
+    # machines, especially at larger k or with gemma-2-9b.
+    # do_sample=False (greedy) keeps generation deterministic, and
+    # since no other logits processors are active, outputs.scores are
+    # the model's raw pre-softmax logits at each step -- exactly what
+    # shannon_entropy() in entropy.py expects.
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -88,4 +127,3 @@ def extract_logits(
     ]
 
     return logits
-
